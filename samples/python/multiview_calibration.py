@@ -11,6 +11,7 @@ import sys
 import time
 
 from datetime import datetime
+from pathlib import Path
 
 import cv2 as cv
 import joblib
@@ -53,9 +54,9 @@ def read_gt_rig(file, num_cameras, num_frames):
 
             # 1 line of translation
             f.readline()
-            t = np.zeros([3, 1])
+            t = np.zeros((3, 1), dtype=float)
             for i in range(3):
-                t[i] = np.array(float(f.readline().strip().split(" ")[0]))
+               t[i, 0] = float(f.readline().strip().split()[0])
             tvecs_gt.append(t)
 
         # Read in frame gt
@@ -78,9 +79,9 @@ def read_gt_rig(file, num_cameras, num_frames):
 
             # 3 line of translation
             f.readline()
-            t = np.zeros([3, 1])
+            t = np.zeros((3, 1), dtype=float)
             for i in range(3):
-                t[i] = np.array(float(f.readline().strip().split(" ")[0]))
+                t[i, 0] = float(f.readline().strip().split()[0])
             tvecs0_gt.append(t)
 
     return Ks_gt, distortions_gt, rvecs_gt, tvecs_gt, rvecs0_gt, tvecs0_gt
@@ -161,6 +162,7 @@ def plotCamerasPosition(R, t, image_sizes, pairs, pattern, frame_idx, cam_ids, d
     # Plot lines between cameras
     base_width = 3 / detection_mask.shape[1]
     maps_pairs = set()
+    edge_line = None
     for (i, j) in pairs:
         overlaps = np.sum((detection_mask[i] > 0) * (detection_mask[j] > 0))
         maps_pairs.add((np.minimum(i, j), np.maximum(i, j)))
@@ -170,6 +172,7 @@ def plotCamerasPosition(R, t, image_sizes, pairs, pattern, frame_idx, cam_ids, d
         edge_line = ax.plot(xs, ys, zs, '-', color='black', linewidth=overlaps * base_width)[0]
 
     # Plot all connected points
+    edge_line_extra = None
     for i in range(len(R)):
         for j in range(i + 1, len(R)):
             overlaps = np.sum((detection_mask[i] > 0) * (detection_mask[j] > 0))
@@ -184,7 +187,15 @@ def plotCamerasPosition(R, t, image_sizes, pairs, pattern, frame_idx, cam_ids, d
                 edge_line_extra = ax.plot(xs, ys, zs, '--', color='gray', linewidth=overlaps * base_width)[0]
 
     ax.scatter(pattern[:, 0], pattern[:, 1], pattern[:, 2], color='red', marker='o')
-    ax.legend(ax_lines + [edge_line] + [edge_line_extra], cam_ids + ['stereo pair'] + ['full pairs'], fontsize=6)
+    legend_handles = list(ax_lines)
+    legend_labels  = list(cam_ids)
+    if edge_line is not None:
+        legend_handles.append(edge_line)
+        legend_labels.append('stereo pair')
+    if edge_line_extra is not None:
+        legend_handles.append(edge_line_extra)
+        legend_labels.append('full pairs')
+    ax.legend(legend_handles, legend_labels, fontsize=6)
 
     dim_box = getDimBox(np.concatenate((all_pts)))
 
@@ -236,7 +247,7 @@ def plotDetection(image_sizes, image_points):
 
 # [plot_detection]
 
-def showUndistorted(image_points, Ks, distortions, image_names):
+def showUndistorted(image_points, Ks, distortions, image_names, cam_ids):
     detection_mask = getDetectionMask(image_points)
     for cam in range(len(image_points)):
         detected_imgs = np.where(detection_mask[cam])[0]
@@ -561,7 +572,8 @@ def saveToFile(path_to_save, **kwargs):
         if key == 'image_names':
             save_file.write('image_names', list(np.array(kwargs['image_names']).reshape(-1)))
         elif key == 'cam_ids':
-            save_file.write('cam_ids', ','.join(cam_ids))
+            cam_ids_list = kwargs['cam_ids']
+            save_file.write('cam_ids', ','.join(cam_ids_list))
         elif key == 'distortions':
             value = kwargs[key]
             save_file.write('distortions', np.concatenate([x.reshape([-1,]) for x in value],axis=0))
@@ -1006,6 +1018,68 @@ if __name__ == '__main__':
             board_dict_path=params.board_dict_path,
         )
         output['cam_ids'] = cam_ids
+
+out_dir = Path(params.path_to_save or ".").parent / "plots"
+out_dir.mkdir(parents=True, exist_ok=True)
+
+for cam_idx, cam_id in enumerate(output["cam_ids"]):
+    # calibrate this camera once to get per-frame rvecs/tvecs
+    objpts   = [output["pattern_points"]] * len(output["image_points"][cam_idx])
+    imgpts   = output["image_points"][cam_idx]
+    _, K_cam, dist_cam, rvecs_cam, tvecs_cam = cv.calibrateCamera(
+        objpts, imgpts, tuple(output["image_sizes"][cam_idx]), None, None
+    )
+
+    mean_errs = []
+    for fidx, pts in enumerate(imgpts):
+        if pts.size == 0:
+            continue
+
+        # load image & project
+        img = cv.imread(output["image_names"][cam_idx][fidx])
+        proj, _ = cv.projectPoints(
+            output["pattern_points"],
+            rvecs_cam[fidx],
+            tvecs_cam[fidx],
+            K_cam,
+            dist_cam
+        )
+
+        # spatial-error plot
+        fig, ax = plt.subplots()
+        ax.imshow(cv.cvtColor(img, cv.COLOR_BGR2RGB))
+        ax.scatter(pts[:, 0], pts[:, 1],   label="detected")
+        ax.scatter(proj[:, 0, 0], proj[:, 0, 1], label="reprojected")
+        for d, p in zip(pts, proj[:, 0]):
+            ax.arrow( d[0], d[1],
+                      p[0] - d[0], p[1] - d[1],
+                      width=0.3, head_width=2, length_includes_head=True )
+        ax.set_title(f"{cam_id} frame {fidx} spatial errors")
+        ax.legend()
+        fig.savefig(out_dir / f"{cam_id}_spatial_{fidx}.png")
+        plt.close(fig)
+
+        # accumulate mean reprojection error for this frame
+        proj2d = proj.reshape(-1, 2)
+        mean_errs.append( np.linalg.norm(pts - proj2d, axis=1).mean() )
+
+    # reprojection-error curve
+    fig, ax = plt.subplots()
+    ax.plot(mean_errs, marker="o")
+    ax.set(title=f"Reprojection Errors for {cam_id}",
+           xlabel="Frame Index",
+           ylabel="Error (px)")
+    fig.savefig(out_dir / f"{cam_id}_reproj_errors.png")
+    plt.close(fig)
+
+    # error-distribution histogram
+    fig, ax = plt.subplots()
+    ax.hist(mean_errs, bins=10)
+    ax.set(title=f"Error Distribution: {cam_id}",
+           xlabel="Error (px)",
+           ylabel="Frequency")
+    fig.savefig(out_dir / f"{cam_id}_error_distribution.png")
+    plt.close(fig)
 
     # Evaluate the error
     if params.gt_file is not None:
